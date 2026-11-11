@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>vehicle_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    HENES T870 HLC bridge: joystick manual teleop + auto command arbitration,
+    E-Stop, Manual/Auto switching, and RS232 packet I/O to the Arduino LLC.
+  </description>
+
+  <maintainer email="dladmsrbs12350@gmail.com">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>joy</exec_depend>
+  <exec_depend>morai_msgs</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+</package>

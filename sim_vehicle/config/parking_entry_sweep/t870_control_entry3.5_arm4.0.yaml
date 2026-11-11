@@ -1,0 +1,183 @@
+# 2026-08-23: 속도 m/s 변환 및 종방향 폐루프 구현 전 버전의 주행 설정이다.
+# 이 버전은 기존 Int32 raw PWM 명령을 vehicle_bridge에 직접 전달한다.
+
+waypoint_follower_node:
+  t_parking_entry_dist: 3.5  # sweep 자동생성
+  t_parking_entry_arm: 4.0  # sweep 자동생성
+  # ---------- 토픽 및 주행 허가 ----------
+  odometry_topic: /odom_fused
+  gnss_ready_topic: /vehicle1/c099/localization_ready
+  localization_ready_topic: /localization/ready
+  raw_speed_command_topic: /vehicle/cmd_speed
+  steering_command_topic: /vehicle/cmd_steer
+  gear_command_topic: /vehicle/cmd_gear
+  map_frame: map
+
+  # GNSS READY, EKF READY, fused odom 중 하나라도 오래되면 정지한다.
+  localization_timeout_sec: 0.5
+
+  # ---------- 차량 기하 및 조향 제한 ----------
+  # 후륜축 중심부터 전륜 조향축 중심까지 거리[m].
+  wheel_base: 0.75
+
+  # 좌우 중 더 작은 실제 안전 조향각[deg]. vehicle_bridge 설정과 맞춘다.
+  maximum_steering_angle_deg: 20.0
+
+  # ---------- 조향 제어 ----------
+  # 2026-09-07: hybrid_control()의 곡률 임계 PP/Stanley 블렌드를 기본 활성화.
+  # sim_vehicle drift+GPS dropout 조건 A/B 테스트(210초, 동일 구간):
+  #   PP 단독(이전 기본값)   maxCTE 5.64m rmsCTE 2.07m
+  #   하이브리드 블렌드(이거) maxCTE 1.45m rmsCTE 0.75m, steer 평균/std는 거의 동일
+  # lookahead 곡률 스케일링은 개선 없어 기본 false 유지.
+  # 2026-09-08: 속도 연동 lookahead 복원.  Ld = base + gain * |v|  ([min,max] 클램프)
+  #
+  # 여태 EXIT 이후 구간은 lookahead_dist_ 가 3.5 로 하드코딩돼 있어 속도와
+  # 무관했다. pure_pursuit() 위에 주석으로 남아 있던 옛 줄
+  #     cur_speed_ > 15 ? 3.5 + cur_speed_*0.125 : 3.5
+  # 의 상수는 cur_speed_ 가 km/h 이던 ERP42 시절 값이다. 지금은 /odom_fused 의
+  # twist.linear.x 라 m/s 이고 T870 이 15 m/s 를 낼 일이 없어 그대로는 무의미하다.
+  #
+  # gain 0.0 은 base 고정이라 이 변경 전과 동작이 완전히 같다.
+  # 피팅 절차: data_국민대 chunk 를 속도대별로 주행하면서 gain 을 올리고 CTE 를
+  # 본다. 로그의 "cur_speed [m/s]" 와 "final ld" 를 짝지어 기록하면 된다.
+  #
+  # T870 최대속도 15 km/h = 4.17 m/s 기준으로 잡은 범위다. 속도 폭이 좁아서
+  # (0 ~ 4.17 m/s) 속도항이 Ld 에 더할 수 있는 양 자체가 크지 않다.
+  #
+  # 상한을 5.0 으로 둔 이유 - 순수추종은 반경 R 원호를 추종하려면 Ld <= 2R 여야
+  # 한다. 이 코스의 반경 분포에서 Ld 별 추종 불가 구간은:
+  #     Ld 3.5m -> 0.0 m,  4.0m -> 0.7 m,  5.0m -> 2.5 m,  8.0m -> 21.8 m (3%)
+  # chunk 별 R_min 은 1: 3.29m / 2: 1.88m / 3: 4.27m / 4: 1.92m 라
+  # 2R 상한이 각각 6.6 / 3.8 / 8.5 / 3.8 m 다. chunk 2, 4 를 돌 때는
+  # lookahead_speed_max 를 3.5 이하로 낮춰야 안전하다.
+  #
+  # 피팅 출발점 제안 (base 를 낮춰야 속도항이 의미 있는 폭을 갖는다):
+  #     base 2.0 ~ 2.5,  gain 0.4 ~ 0.6,  max 4.5
+  #     -> v=1 m/s 에서 Ld 2.4~3.1,  v=4.17 m/s 에서 Ld 3.7~5.0
+  # base 를 3.5 로 둔 채 gain 을 올리면 4.17 m/s 에서 곧바로 상한에 닿는다.
+  # 스케일링을 전 구간에 적용할지. false(기본)면 여태처럼 mission_state > 32
+  # (평행주차 탈출 이후)에서만 걸리고, 0~32 는 new_process.cpp 의 switch 가 정한
+  # 스테이트별 고정값(1.5~8.0)을 쓴다.
+  #
+  # data_국민대 chunk 의 region 범위가 1: 0~3 / 2: 4~15 / 3: 16~18 / 4: 19~34 라
+  # false 인 채로는 chunk 4 의 region 33~34(약 50 m)만 속도 연동 구간이다.
+  # Ld 피팅 주행에서는 true 로 켤 것. 켜면 스테이트 테이블 값은 전부 무시된다.
+  lookahead_state_override: true
+  lookahead_speed_scaling: true
+  lookahead_speed_base: 2.0     # v=0 에서의 Ld [m]
+  lookahead_speed_gain: 0.7   # [s] 속도 1 m/s 당 Ld 증가분. 0.4→0.7: 고속 진동 억제
+  lookahead_speed_min: 2.0      # 하한 [m]. new_path_tracking.cpp 의 final_ld 하한과 동일
+  lookahead_speed_max: 4.2      # 상한 [m]. 3.5→4.2: 실측 고속 steer_std 1.15°→0.7° 목표
+
+  # 2026-09-14: 이 yaml에 target_state_lock 이 없어서 C++ 기본값([12,30],
+  # CHECK 만 잠김)이 그대로 쓰이고 있었다 -- 정작 방향이 반전되는 후진
+  # 구간(13 T자/31 평행)과 탈출 직후 구간(14/32)은 실차에서 안 잠겨
+  # 있었다. new_path_tracking.cpp:111 주석의 "alpha -67~-118도, 조향
+  # 포화" 버그(진입 쪽은 sim_vehicle.launch 에서 [12,13,28,29,30,31]로
+  # 이미 검증/고정했었다)가 후진/탈출 지점 전부에서 재현될 수 있는
+  # 상태였다. sim 값에도 탈출(14, 32)이 빠져 있어 같이 채운다.
+  target_state_lock: [12, 13, 14, 28, 29, 30, 31, 32]
+
+  # 주의: new_pat게 이번 실주행으로 재확인됐습니다.더 긴 dropout(예: period_sec를 20~30초로 늘려서)도 테스트해볼까요, 아니면 이 정도면 충분하다고 보시나요?h_tracking.cpp 의 final_ld 가드는
+  #     if (final_ld > 20.0) final_ld = 4.0;
+  # 라 클램프가 아니라 불연속 점프다. 지금 상한 5.0 이면 안 걸리지만,
+  # lookahead_speed_max 를 20 근처까지 올리면 목표점 거리가 20 을 넘는 순간
+  # ld 가 4.0 으로 떨어져 조향이 튄다.
+
+  control_hybrid_enable: false
+  control_hybrid_curve_threshold: 0.06
+  control_hybrid_curve_ratio: 0.65
+  # 2026-09-08: data_국민대 CSV 는 rk 를 재계산한 평활 곡률로 교체했다
+  # (원본 rk: std 0.40, |rk|max 25 = R 0.04 m / 교체 후: std 0.10, |rk|max 0.53 = R 1.88 m).
+  # 이제 이 기능을 켜볼 수 있지만 gain 은 다시 잡아야 한다. 교체된 rk 기준으로
+  # gain 60 은 |rk| > 0.042 에서 곧바로 하한에 붙어 전체의 46% 가 2.5 로 눌린다.
+  # max-min = 2.5 를 |rk| 상용역(~0.3)에 걸치려면 gain 은 8 안팎이 출발점이다.
+  lookahead_curvature_scaling: false
+
+# raw PWM의 최종 안전 상한, 조향 포텐셔미터/PID, watchdog은
+# vehicle_bridge/config/vehicle_bridge.yaml에서 설정한다.
+
+  # 2026-09-09: Ld 피팅 결과 반영.
+  #   lookahead_state_override 를 true 로 켜서 코스 전 구간에 같은 식을 쓴다.
+  #   여태 state 0~32 는 new_process.cpp 미션 switch 의 고정값(4.0~8.0)을 썼는데,
+  #   그 값들이 너무 길어서 코너를 잘라먹고 있었다(state 7/21 = 7.5, 26 = 8.0).
+  #   전 구간 오프라인 스윕(sim_vehicle/scripts/offline_sim.py, ROS 실행 48회로
+  #   검증: 안정 조합 rms 편차 평균 +0.03m, 발산 경계 위치 일치) 결과,
+  #   같은 속도에서 max CTE 가 1.201m -> 0.419m 로 줄었다.
+  #   Ld = 2.0 + 0.4*|v| 는 운용 속도 1.7~3.75 m/s 에서 실효 2.7~3.5m 가 된다.
+  #   Ld 2.5 는 고속에서 발산하고(max 2.195m, 조향활동 19 deg/s), 6.5 이상은
+  #   tau 와 무관하게 열화한다. 3.0~4.0 이 tau 0.38~0.60 전체에서 안전한 유일한 띠다.
+  #
+  # 2026-09-09: 속도 배율. 위 Ld 로 생긴 여유를 속도로 바꾼다.
+  #   미션 switch 의 스테이트별 spd_state_ 에 이 값을 곱하고 cap 에서 자른다.
+  #   1.0 이면 꺼짐. speed_override 가 켜져 있으면 그쪽이 이긴다.
+  #   1.6 인 이유: 1.4 -> 1.6 은 max CTE 가 0.573m 로 그대로인데 11초 빨라지고,
+  #   1.8 부터 max 가 0.623m 로 오른다. 상한 900 기준 263초 -> 187초.
+  #   더 밟고 싶으면 2.0 (174초, max 0.623m). 2.0 이면 24/29 state 가 cap 에 걸려
+  #   그 위로는 올려도 변화가 없다.
+  #
+  # 2026-09-09 실측 정정: raw->m/s 는 v = 0.003081 * raw 다.
+  #   실측 2점: raw 350 -> 1.088 m/s (drift_0906 bag, 실외)
+  #             raw 900 -> 2.783 m/s (speed_sweep.bag, 실내)
+  #   두 점이 한 직선에 놓이고 절편이 사실상 0 이다. 단 raw<350 은 미측정이라
+  #   기동 문턱이 그 아래 있어도 이 식으로는 안 보인다.
+  #   -> raw 900 = 10.0 km/h,  raw 1000 외삽 = 11.1 km/h.
+  #      아래 주석에 있던 "900 = 13.5 km/h / 최고 15 km/h" 는 카탈로그값 기준이라
+  #      실측과 다르다. 15 km/h 를 전제로 잡은 Ld/속도 계산은 다시 봐야 한다.
+  #
+  # 2026-09-09 실주행(run3, AUTO 19.5s/23.1m) 대조:
+  #   cmd_speed 는 AUTO 내내 900(2.77 m/s)이 나갔는데 실제 엔코더 속도는
+  #   중앙 0.70 m/s (지령의 25%) 였다. 90% 분위는 3.02 m/s 라 낼 때는 내지만
+  #   절반 이상을 가감속 램프와 기어 재결합에 쓴다.
+  #   따라서 위 오프라인 스윕이 전제한 "운용 속도 1.7~3.75 m/s" 는 실차에서
+  #   아직 성립하지 않는다. 실효 Ld 도 2.0+0.4*0.70 = 2.28 m 로, 스윕이 안전하다고
+  #   한 3.0~4.0 m 띠 아래다. 실측 CTE 는 중앙 1.13 m / max 2.84 m 로
+  #   스윕이 예측한 max 0.419 m 와 크게 다르다.
+  speed_multiplier: 1.0
+  speed_multiplier_cap: 900      # raw. 실측 900 = 2.77 m/s = 10.0 km/h
+
+  # 2026-09-09: 곡률 기반 속도 상한.  v_limit = sqrt(alat / |rk|)
+  #   여태 속도는 미션 스테이트별 고정값(+배율)뿐이라, 같은 스테이트 안에서는
+  #   커브든 직선이든 같은 속도로 갔다. 실주행에서 눈으로 확인된 문제다.
+  #   배율/오버라이드 다음에 적용되므로 그 결과까지 제한한다.
+  #
+  #   preview 만큼 앞의 웨이포인트 |rk| 최대값을 쓴다. 최근접 한 점만 보면
+  #   이미 커브에 들어간 뒤라 감속이 늦는다.
+  #
+  #   전제: rk 가 정상이어야 한다. waypoint_saver 원시 rk 는 R 을 실제의 1/2.6 로
+  #   보고해서(실측 R_min 4.94 m -> 1.89 m) 그대로 쓰면 60% 과다감속한다.
+  #   waypoint_maker/scripts/recompute_rk.py 로 재계산한 CSV 를 쓸 것.
+  #
+  #   alat 값 고르기 (현재 경로 R_min 4.94 m, 차량 최고 2.77 m/s 기준):
+  #     1.0 -> 최소 2.22 m/s, 경로의 56% 에서 감속
+  #     1.5 -> 최소 2.72 m/s, 경로의  1% 에서 감속
+  #     2.0 -> 감속 없음 (차량 최고속이 먼저 걸림)
+  #   run3 IMU 실측 구심가속도(v x yaw_rate)는 90% 분위 1.77 / 최대 3.95 m/s^2 로
+  #   타이어 한계에 닿은 흔적은 없었다. 따라서 이 값은 미끄러짐 방지가 아니라
+  #   제어 여유(코너 진입 자세, Ld 축소)를 위한 것이다.
+  #   0 = 비활성. 실차에서 1.0 부터 올려가며 CTE 를 볼 것.
+  speed_curvature_alat: 0.5  # [m/s^2] 0 이면 꺼짐 = 종전 동작과 동일
+  speed_curvature_preview: 3.0   # [m] 이만큼 앞을 보고 미리 줄인다
+  speed_curvature_min_raw: 150   # raw. 이 아래로는 안 깎는다(기어 재결합 실패 방지)
+
+  # 2026-09-10: CTE 반응형 감속.
+  #   raw_limit = min_raw + (nominal - min_raw) / (1 + gain * cte)
+  #   위 speed_curvature_alat 은 지도의 rk 를 미리 보고 깎는 "사전예측" 이라
+  #   preview 타이밍이 어긋나면 못 따라간다. 용인 코스 state1-2 급커브에서
+  #   preview 를 예상 EKF 지연만큼 늘려도 조향이 ±20deg 에 포화된 뒤에야
+  #   감속이 걸려 CTE 가 3.02 m 까지 벌어졌다(/vehicle/cmd_speed 트레이스로
+  #   확인, 그 지연보정 코드는 효과 없어 폐기). 이쪽은 원인(지연/커브/추정
+  #   오차)을 안 가리고 결과인 cte 만 보고 즉시 깎아서 훨씬 견고했다.
+  #
+  #   sim 검증(용인 원본 728m, EKF 지연 모델 켠 상태, 곡률감속 0.5 동시 적용):
+  #                    중앙값   75%     90%     최대    완주시간
+  #     gain 0 (종전)   0.05    0.08    0.33    3.02    444.8 s
+  #     gain 1.0        0.0444  0.0681  0.1289  1.96    455.6 s
+  #     gain 1.5        0.0445  0.0681  0.1287  1.99    461.5 s
+  #   1.5 는 1.0 대비 정확도 이득이 없고 6 초 더 느려서 1.0 을 택했다.
+  #   시간 손해(+10.9%)가 부담되면 0.5 로 낮추거나 0 으로 끄면 종전 동작.
+  #
+  #   하한은 speed_curvature_min_raw 를 공유한다. gain 1.0 에서 이 하한까지
+  #   내려가려면 cte 가 139 m 여야 하므로 실질적으로 하한에 닿지 않는다.
+  #   실차 미검증. 첫 주행은 이 값을 0 으로 두고 종전 거동을 확인한 뒤 올릴 것.
+  speed_cte_gain: 1.0   # [1/m] 0 이면 꺼짐 = 종전 동작과 동일

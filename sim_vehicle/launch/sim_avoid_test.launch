@@ -1,0 +1,77 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- 2026-09-08: 장애물 회피 통합 테스트.
+       sim_vehicle 위에 가짜 라이다(fake_obstacles_node)와 실제 회피 판정
+       노드(lane_avoid_selector_node)를 얹는다. 장애물은 map 에 고정해 두고
+       가짜 라이다가 매 주기 laser 프레임으로 바꿔 발행하므로, 실차와
+       동일한 파이프라인(/obstacles -> 회피 판정 -> lane_number_msg_)을 탄다.
+
+       S자 구간(state 7) 3차선 배치:
+         lane 0 = 0.csv (왼쪽)   lane 2 = 2.csv (가운데)   lane 1 = 1.csv (오른쪽)
+       장애물은 가운데 경로에서 횡 0.55m 에 두었다(통로 반폭 0.9m 안이라
+       확실히 막힘). 25m 오른쪽 / 50m 왼쪽 / 75m 오른쪽 순서라
+       왼쪽->오른쪽->왼쪽 회피가 차례로 나와야 한다. -->
+
+  <arg name="start_rviz" default="false" />
+  <arg name="avoid_state" default="7" />
+  <arg name="center_lane" default="2" />
+
+  <!-- map 좌표 [x,y,r, ...].
+       2026-09-08: 세 차선이 실제로 벌어진 구간은 arc 20~55m 뿐이다.
+       그 밖(특히 60m 이후)은 세 경로가 0.0~0.3m 로 붙어 있어 피할 차선이
+       없다. 처음에 75m 에 뒀다가 세 차선이 전부 막혀 0.44m 까지 스쳤다.
+       25m(오른쪽) / 40m(왼쪽) / 52m(오른쪽) 로 옮겼고, 각각
+       "가운데 막힘 + 반대쪽 한 차선만 통과" 를 사전 검증했다. -->
+  <arg name="obstacles"
+       default="[-59.111, -33.082, 0.15,
+                 -72.456, -30.034, 0.15,
+                 -79.761, -21.633, 0.15]" />
+
+  <include file="$(find sim_vehicle)/launch/sim_vehicle.launch">
+    <arg name="start_rviz" value="$(arg start_rviz)" />
+  </include>
+
+  <node name="fake_obstacles_node" pkg="sim_vehicle" type="fake_obstacles_node.py"
+        output="screen">
+    <rosparam param="obstacles" subst_value="True">$(arg obstacles)</rosparam>
+    <param name="max_range" value="12.0" />
+    <param name="odom_topic" value="/odom_fused" />
+  </node>
+
+  <node name="lane_avoid_selector_node" pkg="obstacle_bridge"
+        type="lane_avoid_selector_node" output="screen">
+    <param name="mission_state" value="$(arg avoid_state)" />
+    <param name="main_lane"   value="0" />
+    <param name="center_lane" value="$(arg center_lane)" />
+    <param name="left_lane"   value="0" />
+    <param name="right_lane"  value="1" />
+
+    <!-- 자차 pose 는 sim 이 /odom_fused 로 준다. 듀얼 GPS 는 없으므로
+         odom_topic 을 그대로 쓰고 odom_front/back 은 오지 않는다. -->
+    <param name="odom_topic" value="/odom_fused" />
+    <param name="state_topic" value="gps_state" />
+
+    <param name="lookahead_dist" value="10.0" />
+    <param name="block_frames"   value="3" />
+    <param name="clear_frames"   value="5" />
+    <param name="switch_cooldown" value="1.0" />
+    <param name="pass_margin"    value="1.5" />
+    <!-- 2.csv 는 S자 구간만 담고 그 안이 전부 state 7 이라, 끝에 닿아도
+         state 가 안 바뀐다. 경로 끝 복귀를 끄면 그대로 갇힌다(실측). -->
+    <param name="return_at_path_end" value="true" />
+    <param name="path_end_dist" value="6.0" />
+  </node>
+
+  <!-- 차선 변경으로 못 피하는 장애물(세 차선 다 막힘)은 정지로 처리한다.
+       lane_avoid_selector 는 차선만 고르고 멈추지는 않는다. 실차 런치
+       (parking_and_avoid.launch)도 이 둘을 함께 띄운다. -->
+  <node name="obstacle_path_bridge_node" pkg="obstacle_bridge"
+        type="obstacle_path_bridge_node" output="screen">
+    <param name="odom_topic" value="/odom_fused" />
+    <param name="state_topic" value="gps_state" />
+    <param name="path_topic" value="/local_path" />
+    <param name="max_ahead_dist" value="3.0" />
+    <!-- 팔로워가 정지를 보는 구간. 지금은 S자(7)만 켠다. -->
+    <rosparam param="gate_states">[7]</rosparam>
+  </node>
+</launch>

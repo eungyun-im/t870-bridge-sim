@@ -1,0 +1,142 @@
+# ============================================================
+#  vehicle_bridge parameters (HENES T870 HLC)
+# ============================================================
+
+# ---- Serial (HLC <-> LLC, RS232) ----
+serial_port: "/dev/ttyArduino"   # LLC port. NOTE: IMU(iahrs) uses ttyUSB0.
+serial_port_candidates: ["/dev/ttyArduino", "/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"]
+baudrate: 115200              # protocol spec: 115200 8N1
+control_rate: 20.0           # Hz  (protocol cycle time 50 ms)
+serial_retry_period: 1.0     # s; retry when Arduino USB temporarily disappears
+serial_open_wait: 2.5        # s; Arduino Mega resets after USB serial open
+# If the port can't be opened, the node keeps running in dry-run
+# (logs the packets) so the joystick can be tested without the LLC.
+
+# ---- Topics ----
+joy_topic: "/joy"
+# AUTO command from waypoint_follower (plain std_msgs - no morai_msgs / erp_driver needed)
+auto_speed_topic: "/vehicle/cmd_speed"   # std_msgs/Int32   : raw drive command 0..1000
+auto_steer_topic: "/vehicle/cmd_steer"   # std_msgs/Float32 : steering angle in degrees
+auto_gear_topic:  "/vehicle/cmd_gear"    # std_msgs/Int32   : 0=FORWARD 1=NEUTRAL 2=BACKWARD
+
+# ---- Joystick axes (Xbox 360 compatible pad, left stick driving) ----
+throttle_mode: "axis"        # axis: left-stick throttle; trigger_pair: RT forward / LT reverse
+throttle_axis: 1             # left-stick Y: NEGATIVE = forward, POSITIVE = reverse
+forward_trigger_axis: 5      # RT: -1 released, +1 pressed
+reverse_trigger_axis: 2      # LT: -1 released, +1 pressed
+steer_axis: 3                # right-stick X on current Xbox-compatible pad
+throttle_deadzone: 0.50      # Increased from 0.08 to 0.50 to prevent unintended acceleration from joystick drift (0.46 offset)
+steer_deadzone: 0.05
+# 2026-08-26: 스틱을 놓았을 때 조향축이 안착하는 값. 0 이면 보정 없음.
+# 실측: 놓을 때마다 -0.27 (18:18 구간 461샘플 연속, 최대변위는 정상적으로 +-1.00).
+# 보정 전에는 중립에서 tgt=303 이 나와 조향이 왼쪽으로 물려 있었다.
+# 패드를 바꾸거나 스틱을 교정하면 이 값도 다시 재야 한다:
+#   rostopic echo /joy/axes  ->  steer_axis(3) 의 정지 상태 값
+steer_axis_center: 0.0
+invert_throttle: false       # axis mode only
+invert_steer: false           # flip steer sign (left/right) to match hardware
+
+# ---- Joystick buttons (indices vary per pad - tune with jstest) ----
+estop_button: -1              # press -> latch E-STOP ON (-1 for disabled)
+estop_reset_button: -1        # press (throttle neutral) -> clear E-STOP (-1 for disabled)
+estop_toggle_button: 5       # press -> toggle E-STOP on/off (off needs throttle neutral)
+mode_toggle_button: 7        # toggle MANUAL <-> AUTO
+deadman_button: -1           # -1 = disabled. set e.g. 5 (RB) to require hold-to-drive
+
+# ---- Boot safety ----
+boot_estop: true             # E-STOP latched on startup. set false for bench testing.
+boot_mode: "MANUAL"          # MANUAL or AUTO. AUTO lets the car run without a joystick;
+                             # a connected pad can still toggle back with mode_toggle_button.
+
+# ---- Manual limits (safety) ----
+# 2026-09-09: 650 -> 900. raw->m/s 캘리브레이션을 MANUAL 로 하려면 AUTO 상한
+# (auto_max_speed 900)과 같은 범위를 낼 수 있어야 한다. 실내 측정이 끝나면
+# 되돌릴 것 - 조이스틱 풀스로틀이 곧바로 최고속이 된다.
+manual_max_speed: 500        # raw command cap (protocol allows 0~1000)
+manual_max_steer_deg: 30.0   # maps to STEER = deg*100 (protocol +-2000 = +-20 deg)
+
+# ---- Phase B: HLC steering closed loop (tune from Phase A measurements) ----
+# Pot calibration (raw A8 counts). Measure with /vehicle/steer_adc_raw, then fill in.
+pot_center: 505.0            # straight-ahead measured from current adc_raw neutral
+pot_left:  50.0            # full LEFT  (min angle / left end-stop)
+pot_right:  950.0            # full RIGHT (max angle / right end-stop)
+steer_cmd_max_deg: 20.0      # setpoint full-scale (deg) -> maps to pot_left..pot_right
+# PID: input = pot-count error, output = steer motor PWM
+steer_kp: 0.2         # start P-only; raise until it tracks without buzzing
+steer_ki: 0.0
+steer_kd: 0.025
+steer_pwm_min: 18           # min PWM to overcome static friction
+steer_pwm_max: 200           # safety cap; MUST stay <= Arduino STEER_PWM_MAX (220)
+steer_deadband: 19.0        # filtered pot counts; within this of target -> motor off
+steer_raw_deadband: 26.0    # raw pot counts; stop immediately near target to prevent overshoot
+steer_pwm_slew_per_cycle: 22 # max signed PWM change per 20 Hz control cycle
+# Feedback EMI filter (median spike-reject -> EMA). Tune after seeing Phase A noise.
+adc_median_window: 5        # samples; larger = more spike rejection, more lag
+adc_ema_alpha: 0.32       # 0..1; smaller = smoother but laggier
+
+# ---- Auto mapping ----
+# waypoint_follower already emits a raw 0..1000 drive command, so scale is pass-through.
+auto_speed_scale: 1.0        # /vehicle/cmd_speed * scale -> raw speed
+auto_max_speed: 900          # safety cap; raise only after a successful low-speed run
+auto_steer_sign: -1.0         # flip to -1.0 if auto steers the wrong way
+
+# ---- Drive rate limiter / direction interlock / stall guard ----
+# LLC 의 driveControl() 은 DIR 을 쓰고 곧바로 PWM 을 쓰는 pass-through 라,
+# 여기서 내보낸 값이 그대로 모터에 걸린다. 램프와 방향전환 인터록은 이 노드가 소유한다.
+# 2026-09-01: 가속 250->500, 감속 400->2000.
+#   감속을 공격적으로 잡아도 되는 이유:
+#   PWM 0 은 제동이 아니라 MD20A 관성주행(free-wheel)이다. 역토크를 거는 게
+#   아니라 구동력을 빼는 것뿐이라 구동계 충격이 없다. 실제로 E-STOP/워치독/
+#   스톨 경로는 이미 램프를 우회해 한 사이클(0.05s)에 0 으로 컷한다.
+#   느린 감속 램프는 "정지 명령 후에도 계속 구동"을 뜻해 정지거리만 늘렸다.
+#   반대로 가속은 램프가 필요하다 - 급격한 토크 인가는 휠 슬립과 돌입전류를 만든다.
+#
+#   미션 지령이 150~250 범위(state 9 = 250, 나머지 150~180)라 그 기준으로 잡았다.
+#     0->250 가속 : 1.00s -> 0.50s
+#     250->0 감속 : 0.63s -> 0.13s   (약 2.5 사이클)
+#     180->0 감속 : 0.45s -> 0.09s
+# 2026-09-09: 500 -> 250. 정지 상태에서 출발할 때 경로를 크게 벗어나는 현상.
+# 조향은 P 제어(steer_kp 0.2)에 슬루 제한(steer_pwm_slew_per_cycle 30 @ 20Hz)이
+# 걸려 있어 PWM 0->200 에 최소 0.33 s 가 든다. 그 사이 구동은 500 raw/s
+# (= 1.54 m/s^2) 로 가속하므로, 조향이 목표각에 닿기 전에 차가 이미 움직인다.
+# 게다가 v=0 에서는 Ld 가 하한(lookahead_speed_base 2.0)이라 순수추종 게인이
+# 가장 높은 시점이기도 하다. 250 이면 0->900 이 1.8 s -> 3.6 s 가 되어
+# 조향이 먼저 자리잡는다.
+# 감속(drive_decel_raw_per_s)은 안전 항목이라 그대로 둔다.
+drive_accel_raw_per_s: 700.0   # 가속 램프
+drive_decel_raw_per_s: 2000.0  # 감속 램프. 안전 우선으로 가속보다 훨씬 빠르게
+                              # E-STOP / 워치독 stale 은 램프를 우회해 즉시 0 (안전 > 부드러움)
+
+# 방향 전환(F<->B)은 반드시 정지를 경유한다. PWM 0 은 관성 주행의 시작일 뿐이라
+# 시간 dwell 과 인코더 정지를 AND 로 확인한 뒤에야 새 기어를 내보낸다.
+gear_change_dwell: 0.3        # s : 램프가 0 에 닿은 뒤 최소 대기
+# 2026-09-11: 2 -> 1. moving = |enc_delta| > eps 이므로 eps 를 올리면 더
+# 헐렁해진다(정지 판정 문턱이 이 이하까지 "정지"로 봐줌). 20Hz, 85.4
+# ticks/m 기준 eps=2 는 약 0.46 m/s 까지도 정지로 판정해, 그 속도로
+# 전진 관성이 남은 채 기어가 후진으로 풀릴 수 있었다(주차 후진
+# 시퀀스에서 실제로 걸리는 구간). eps=1 -> 약 0.23 m/s 로 절반.
+# 0 으로는 안 내린다 - 정지 상태에서도 인코더 양자화 잡음으로 1 틱씩
+# 튀면 영원히 "움직이는 중"으로 읽혀 gear_change_max_wait(3.0s) 강제
+# 해제에만 의존하게 된다.
+gear_change_enc_eps: 1        # counts/frame : 이 이하면 정지로 판정
+gear_change_max_wait: 3.0     # s : 이만큼 speed 0 이면 인코더가 뭐라 하든 기어 해제
+                              #     (인코더 노이즈로 차가 영영 안 움직이는 것 방지, 경고 로그 남김)
+encoder_stale_timeout: 0.5    # s : 피드백이 끊기면 인코더 판정 불가 -> 인터록은 dwell 만으로 동작
+
+# 스톨 가드: 바퀴가 막혔는데 명령이 유지되면 모터가 스톨 전류를 계속 먹는다.
+# 인코더가 부팅 후 한 번이라도 움직인 걸 확인해야 컷한다(미배선이면 경고만).
+stall_timeout: 2.0            # s : 0 이면 비활성
+stall_min_speed_raw: 300     # 이 미만 명령은 스톨 판정 제외
+
+# 기동 토크 미만 구간(raw 20 -> PWM 5 = 2% duty)은 안 움직이고 코일만 달군다.
+# 하한 미만이면 0 으로 떨어뜨린다(하한으로 올리지 않는다 - 정지 명령이 주행이 되면 안 됨).
+# 0 = 비활성. 정지 상태에서 실제 breakaway PWM 을 측정한 뒤 값을 채울 것.
+drive_min_move_raw: 0
+
+# ---- Watchdog (stale input -> stop) ----
+joy_timeout: 0.5             # s : MANUAL mode, no /joy -> stop
+auto_timeout: 0.5            # s : AUTO mode, no /vehicle/cmd_speed -> stop
+                             #     (AUTO does not require a joystick at all)
+
+# ---- DRY-RUN logging ----
+dry_log_period: 0.1          # s : heartbeat period (0.05 = full 20Hz; logs on change too)

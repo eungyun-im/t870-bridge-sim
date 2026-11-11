@@ -1,0 +1,33 @@
+<launch>
+  <!-- Arduino Mega 2560 (t870_llc.ino, direct serial) -->
+  <arg name="serial_port" default="/dev/ttyArduino"/>
+  <arg name="serial_baud" default="115200"/>
+  <!-- keyboard bench/manual tests start with E-STOP released -->
+  <arg name="boot_estop" default="false"/>
+  <!-- MANUAL or AUTO. AUTO drives straight from waypoint_follower commands. -->
+  <arg name="boot_mode" default="MANUAL"/>
+  <!-- 2026-09-01: 구동 램프를 런치에서 바로 조정할 수 있게 뺀다.
+       빈 값이면 config/vehicle_bridge.yaml 의 값을 쓴다. -->
+  <arg name="drive_accel_raw_per_s" default=""/>
+  <arg name="drive_decel_raw_per_s" default=""/>
+
+  <!-- roslaunch does not forward an interactive terminal to child nodes, so the
+       keyboard reader (needs raw stdin) is NOT started here. Run it separately:
+         rosrun vehicle_bridge keyboard_joy_node.py
+       in its own terminal after this launch is up. -->
+
+  <!-- Direct serial is used, no rosserial connection is needed -->
+
+  <!-- HLC bridge -->
+  <node pkg="vehicle_bridge" type="vehicle_bridge_node.py" name="vehicle_bridge" output="screen">
+    <rosparam command="load" file="$(find vehicle_bridge)/config/vehicle_bridge.yaml"/>
+    <param name="serial_port" value="$(arg serial_port)"/>
+    <param name="baudrate" value="$(arg serial_baud)"/>
+    <param name="boot_estop" value="$(arg boot_estop)"/>
+    <param name="boot_mode" value="$(arg boot_mode)"/>
+    <param unless="$(eval arg('drive_accel_raw_per_s')=='')"
+           name="drive_accel_raw_per_s" value="$(arg drive_accel_raw_per_s)"/>
+    <param unless="$(eval arg('drive_decel_raw_per_s')=='')"
+           name="drive_decel_raw_per_s" value="$(arg drive_decel_raw_per_s)"/>
+  </node>
+</launch>

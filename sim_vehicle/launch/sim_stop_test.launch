@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- 2026-09-08: 동적 장애물 정지 테스트.
+       state 18 경로 정중앙(40m 지점)에 장애물을 놓고, 팔로워가 실제로
+       멈추는지 본다. 팔로워 case 18 의 is_dynamic_ 정지와
+       obstacle_path_bridge 의 gate_states 가 둘 다 18 이어야 걸린다. -->
+
+  <arg name="start_rviz" default="false" />
+  <arg name="stop_state" default="18" />
+  <!-- state 18 경로 위 40m 지점. 정중앙이라 반드시 막힌다. -->
+  <arg name="obstacles" default="[-68.490, -52.300, 0.20]" />
+
+  <include file="$(find sim_vehicle)/launch/sim_vehicle.launch">
+    <arg name="start_rviz" value="$(arg start_rviz)" />
+  </include>
+
+  <node name="fake_obstacles_node" pkg="sim_vehicle" type="fake_obstacles_node.py"
+        output="screen">
+    <rosparam param="obstacles" subst_value="True">$(arg obstacles)</rosparam>
+    <param name="max_range" value="12.0" />
+    <param name="odom_topic" value="/odom_fused" />
+  </node>
+
+  <node name="obstacle_path_bridge_node" pkg="obstacle_bridge"
+        type="obstacle_path_bridge_node" output="screen">
+    <param name="odom_topic" value="/odom_fused" />
+    <param name="state_topic" value="gps_state" />
+    <param name="path_topic" value="/local_path" />
+    <param name="max_ahead_dist" value="5.0" />
+    <rosparam param="gate_states" subst_value="True">[$(arg stop_state)]</rosparam>
+  </node>
+</launch>

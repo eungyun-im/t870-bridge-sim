@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Replays the real-world failure modes measured in
+       drift_0906_1257.bag / drift_0906_1302.bag (drift_analysis.png +
+       /vehicle1/c099/status):
+       1. Steering-servo miscalibration: pot_center configured at 450 but
+          the real straight-ahead ADC was ~560 (a ~6deg standing bias),
+          plus a noisy/oscillating actual-vs-commanded steer angle and a
+          sluggish response (servo backlash).
+       2. Flickering RTK GPS: /localization/ready toggled on/off constantly
+          (some drops lasting ~8s) as the back antenna lost RTK fix
+          (back_not_rtk_fixed / baseline_mismatch). Replayed verbatim from
+          the bag's own /localization/ready trace, looped. -->
+  <arg name="csv_dir" default="$(find sim_vehicle)/../data_시흥/최종/" />
+  <arg name="speed_scale" default="0.0041667" />
+  <arg name="start_rviz" default="true" />
+  <arg name="steer_bias_deg" default="6.0" />
+  <arg name="steer_gain" default="0.9" />
+  <arg name="steer_noise_std_deg" default="4.0" />
+  <!-- 2026-09-08: 조향 지연은 결함이 아니라 차량 물리 특성이라 노드 기본값
+       (0.036, bag 실측 tau 0.55 s)으로 옮겼다. 여기서 덮어쓰지 않는다. -->
+  <arg name="steer_lag_alpha" default="0.036" />
+  <arg name="gps_dropout_profile" default="$(find sim_vehicle)/config/gps_dropout_profile.csv" />
+
+  <param name="/fake_vehicle_node/steer_bias_deg" value="$(arg steer_bias_deg)" />
+  <param name="/fake_vehicle_node/steer_gain" value="$(arg steer_gain)" />
+  <param name="/fake_vehicle_node/steer_noise_std_deg" value="$(arg steer_noise_std_deg)" />
+  <param name="/fake_vehicle_node/steer_lag_alpha" value="$(arg steer_lag_alpha)" />
+  <param name="/fake_vehicle_node/gps_dropout_profile" value="$(arg gps_dropout_profile)" />
+
+  <include file="$(find sim_vehicle)/launch/sim_vehicle.launch">
+    <arg name="csv_dir" value="$(arg csv_dir)" />
+    <arg name="speed_scale" value="$(arg speed_scale)" />
+    <arg name="start_rviz" value="$(arg start_rviz)" />
+  </include>
+</launch>
