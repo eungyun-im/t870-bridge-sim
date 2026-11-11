@@ -1,6 +1,4 @@
 __pycache__/
 *.pyc
-sim_vehicle/logs/
-sim_vehicle/scratch/
 build/
 devel/

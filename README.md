@@ -1,103 +1,103 @@
 <div align="center">
 
-# t870-bridge-sim
+# t870-vehicle-bridge
 
-**Vehicle bridge and a lightweight simulator for a HENES T870 ride-on car,<br>used by KUUVe at the HL FMA 2026 Autonomous Driving Competition.**
+**Low-level control of a HENES T870 ride-on car: Arduino Mega firmware for the motors and sensors,<br>and a ROS node on the PC that closes the steering loop over a binary serial link.**
 
-![ROS](https://img.shields.io/badge/ROS_1-22314E?style=flat-square&logo=ros&logoColor=white)
+![Arduino](https://img.shields.io/badge/Arduino_Mega_2560-00878F?style=flat-square&logo=arduino&logoColor=white)
+![C++](https://img.shields.io/badge/C++-00599C?style=flat-square&logo=cplusplus&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
-![Arduino](https://img.shields.io/badge/Arduino_Mega-00878F?style=flat-square&logo=arduino&logoColor=white)
-![RS232](https://img.shields.io/badge/RS232-115200_bps-555555?style=flat-square)
+![ROS](https://img.shields.io/badge/ROS_1-22314E?style=flat-square&logo=ros&logoColor=white)
+![Serial](https://img.shields.io/badge/115200_8N1-20_Hz-555555?style=flat-square)
 
 HL FMA (Future Mobility Award) 2026 Autonomous Driving Competition · Encouragement Award · Team KUUVe
 
-[Overview](#overview) · [Vehicle bridge](#vehicle_bridge) · [Simulator](#sim_vehicle) · [Simulator vs real car](#checking-the-simulator-against-the-real-car) · [Limitations](#limitations)
+[Architecture](#architecture) · [Firmware](#firmware) · [Protocol](#protocol) · [Steering loop](#steering-loop) · [Safety](#safety) · [Bring-up](#bring-up) · [Limitations](#limitations)
 
 </div>
 
 ---
 
-## Overview
+## Architecture
 
-Two ROS 1 packages for one car:
+```text
+ PC (HLC, ROS node)                                Arduino Mega (LLC)
+ ───────────────────                                ──────────────────
+ joystick / autonomy cmd                            drive motor  MD20A   PWM 4, DIR 22
+ steering PID on pot feedback   ── 13 B @ 20 Hz ─▶ steer motor  MD10C   PWM 5, DIR 24
+ drive ramp, gear interlock     ◀─ 17 B @ 20 Hz ── encoder A/B          INT1 / D2
+ command / encoder watchdogs                        steering pot          A8 (10-bit ADC)
+```
 
-| Package | Role |
+The first version ran a P controller for steering inside the Arduino. Every gain change needed a reflash, and the ADC noise during motor motion made the loop hard to tune there. The steering loop was moved to the PC: the Arduino now passes a signed PWM through, keeps only hardware safety guards, and reports the raw potentiometer value back.
+
+## Firmware
+
+[`arduino/t870_llc/t870_llc.ino`](arduino/t870_llc/t870_llc.ino)
+
+| Part | Implementation |
 |---|---|
-| [`vehicle_bridge`](vehicle_bridge) | PC (high-level controller) ↔ Arduino Mega (low-level controller) over RS232, plus the Arduino firmware |
-| [`sim_vehicle`](sim_vehicle) | Hardware-free stand-in for the car, GPS and EKF, scenario launches, and an offline simulator for parameter sweeps |
+| Drive motor | Direction pin plus `analogWrite` PWM; command 0 to 1000 mapped linearly to PWM 0 to 255 |
+| Steering motor | Signed PWM from the PC: sign sets the direction pin, magnitude is the PWM, capped at 220 |
+| Encoder | Quadrature on an interrupt: on A rising, the level of B gives the direction. The 32-bit count is copied with interrupts disabled so the main loop never reads a half-updated value |
+| Steering potentiometer | 8-sample average for the end-stop guard; a wrap guard pins the value to the nearest edge when the pot jumps across its electrical boundary |
+| Control period | 50 ms, scheduled with `last += period` so the loop does not drift |
+| Receive | Byte-wise state machine that resynchronizes on the `STX` header and accepts a frame only with the correct `CR LF` tail |
 
-The path planner and path follower run on top of these and are not part of this repository.
+Hardware fixes made on the car: the potentiometer line on A8 picked up motor noise, which was reduced with a capacitor filter, and the wiring was rebuilt with WAGO connectors and a star ground.
 
-## vehicle_bridge
+## Protocol
 
-**Protocol** (20 Hz, 115200 bps)
+| Direction | Size | Byte order | Fields |
+|---|---|---|---|
+| PC → Arduino | 13 B | big-endian | `STX` (3) · auto/manual · E-stop · gear · speed u16 · steer PWM i16 · alive · `CR LF` |
+| Arduino → PC | 17 B | little-endian | `STX` (3) · auto/manual · E-stop · gear · pot ADC u16 · applied steer PWM u16 · encoder i32 · alive · `CR LF` |
 
-| Direction | Size | Fields |
-|---|---|---|
-| PC → Arduino | 13 B, big-endian | `STX` · auto/manual · E-stop · gear · speed · steer · alive · `CR LF` |
-| Arduino → PC | 17 B, little-endian | `STX` · auto/manual · E-stop · gear · steering ADC · applied steer PWM · encoder · alive · `CR LF` |
+The Arduino echoes the steer PWM it actually applied (after the cap and the end-stop guard), so the PC can see when a guard overrode its command.
 
-The steering loop runs on the PC: the Arduino only drives the motor and reports the potentiometer. The potentiometer signal picked up motor noise, so the PC filters it (median window, then EMA) before the PID. All steering gains are ROS parameters, so tuning needs no reflash.
+## Steering loop
 
-**Safety layers**
+[`scripts/vehicle_bridge_node.py`](scripts/vehicle_bridge_node.py), parameters in [`config/vehicle_bridge.yaml`](config/vehicle_bridge.yaml)
 
-| Layer | Condition | Reaction |
+| Stage | What it does |
+|---|---|
+| Filter | Median of 5 samples rejects spikes, then EMA (α 0.32) smooths |
+| Setpoint | Degrees mapped to a pot target with two segments, so 0° is always the measured center even with an asymmetric pot |
+| Early stop | Stops when the unfiltered value reaches the target, because the filtered value lags and would drive through center into the opposite end stop |
+| PID | Pot-count error to signed PWM; integral clamped against windup; minimum PWM 18 to overcome static friction; deadband 19 counts |
+| Output | PWM capped at 200 (below the firmware cap of 220) and slew-limited to 22 per cycle |
+
+Drive commands are ramped (accelerate 700, decelerate 2000 raw/s), and a change of direction is allowed only after the encoder confirms standstill.
+
+## Safety
+
+| Where | Condition | Reaction |
 |---|---|---|
 | Arduino | Power on | Starts in E-stop until the PC clears it |
-| Arduino | No valid packet for 300 ms | Motors stop, feedback reports E-stop |
-| Arduino | Steering at the left or right end stop | Refuses to push further |
-| Arduino | Any steer command | PWM capped at 220 |
-| PC | Joystick or auto command older than 0.5 s | Steering motor off, no drive |
-| PC | Encoder feedback older than 0.5 s | Treated as unknown, not as stopped |
-| PC | Drive commanded but no encoder motion for 2 s | Drive cut and latched (only once the encoder has been seen working) |
+| Arduino | No valid frame for 300 ms | Drive and steering motors off, feedback reports E-stop |
+| Arduino | Pot at the left or right end stop | Refuses to push further in that direction |
+| PC | Joystick or autonomy command older than 0.5 s | Steering motor off, no drive |
+| PC | Encoder feedback older than 0.5 s | Treated as unknown, gear change waits on time only |
+| PC | Drive commanded, no encoder motion for 2 s | Drive cut and latched (only after the encoder has been seen working) |
+| PC | Serial port lost | Reconnect loop; the Arduino watchdog stops the car meanwhile |
 
-[`FIRST_SETUP.md`](vehicle_bridge/FIRST_SETUP.md) is the bring-up checklist: wheels off the ground, E-stop in reach, watchdog and boot E-stop checked before the first drive.
+## Bring-up
 
-## sim_vehicle
+[`FIRST_SETUP.md`](FIRST_SETUP.md) is the checklist used on the car: wheels off the ground and E-stop in reach, link check before wiring the motors, pot calibration, direction polarity, low PWM cap first, then watchdog and boot E-stop tests before driving.
 
-| Launch | Scenario |
-|---|---|
-| `sim.launch`, `sim_vehicle.launch` | Path following on a recorded course with a kinematic bicycle model |
-| `sim_avoid_test.launch` | Obstacle avoidance with a fake lidar and the real avoidance node |
-| `sim_slot_test.launch` | Picking the empty parking slot (T and parallel) |
-| `sim_stop_test.launch` | Stopping for an obstacle on the path |
-| `sim_traffic_light_test.launch` | Stop and go at the four traffic lights |
-| `sim_full_test.launch` | Avoidance, both parkings and stops in one run |
-| `sim_vehicle_drift.launch` | Replays failure modes recorded on the car (steering offset, GPS dropout) |
-| `sim_vehicle_control_ab.launch` | A/B comparison of controller changes under the drift profile |
-
-Every run writes a timestamped folder with a time series and a summary (`eval_metrics.py`): mission success, cross-track error per mission state, steering reversals. Runs no longer overwrite each other, so A/B comparisons are possible.
-
-`offline_sim.py` runs the same loop without ROS for sweeps (lookahead, speed per state). `offline_validate.py` checks that it reproduces the ROS runs on the same measurement window.
-
-## Checking the simulator against the real car
-
-The first offline simulator predicted a maximum cross-track error of 0.42 m. The real car (run 3) reached 2.84 m. Two causes were found from recorded bags:
-
-| Cause | Evidence | Fix |
-|---|---|---|
-| Wrong speed scale | Encoder calibrated against GPS: raw 350 → 1.09 m/s, raw 900 → 2.78 m/s | `v = raw × 0.003081` |
-| Perfect position fed to the controller | 7 real runs: EKF lag 20 to 160 ms up to 1.86 m/s, 380 to 420 ms from 2.31 m/s | Speed-dependent lag model (logistic fit, RMS residual 44.7 ms) |
-
-The lag fit is used for relative comparisons (which settings cross the 2.27 m/s threshold), not for absolute error predictions.
-
-## Running
+Helper scripts: `adc_raw_monitor.py` (pot noise), `steer_monitor.py`, `joystick_check.py`, `speed_calib.py` (command to m/s from a bag, encoder scale checked against GPS distance).
 
 ```bash
-# real car
-roslaunch vehicle_bridge vehicle_bridge.launch serial_port:=/dev/ttyUSB1
-
-# simulator (needs the team's path loader and follower packages)
-roslaunch sim_vehicle sim_full_test.launch
+roslaunch vehicle_bridge vehicle_bridge.launch serial_port:=/dev/ttyACM0
 ```
 
 ## Limitations
 
-- `sim_vehicle` depends on team packages not included here (`waypoint_maker`, `waypoint_follower`, `obstacle_detector`, `obstacle_bridge`).
-- The lag model rests on 6 data points, two of them taken with a different smoothing setting.
-- Steering response in the simulator is not calibrated; few bags recorded the potentiometer.
-- The EKF noise change made after the lag analysis was not re-verified on the car.
-- Some scripts contain absolute paths from the team machine.
+- The frame has no checksum. A corrupted byte between the header and the tail is accepted; a CRC would close this.
+- The firmware currently uses the USB serial port (`#define HLC Serial`); switch to `Serial2` for the RS232 wiring.
+- The end-stop guard reads the pot while the motor is running, so it is best effort with margin, not precise.
+- The RC transmitter override uses blocking `pulseIn` because A0 to A5 have no pin-change interrupt; it is disabled by default.
+- No automated tests; verification was done on the bench and on the car.
 
 ## License and authorship
 
